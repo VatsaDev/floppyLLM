@@ -7,9 +7,9 @@ import inspect
 from normuon import NorMuon
 
 config = {
-    "n_embd": 256, # 64         
+    "n_embd": 64,         
     "n_head": 8, #8            
-    "n_layer": 16, #4         
+    "n_layer": 4, #4         
     "dropout": 0.2,         
     "vocab_size": 50257,    # update in train
     "ctx_len": 1024,        # update in train 
