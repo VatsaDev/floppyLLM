@@ -1,0 +1,10 @@
+tinystory/
+synth/
+synth_2/
+synthcat/
+__pycache__/
+plots/
+checkpoints/
+nano_ik/
+nano_tokenizer/
+*.zip
