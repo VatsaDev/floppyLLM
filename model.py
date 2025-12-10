@@ -16,6 +16,42 @@ config = {
     "bias": False,           
 }
 
+class RoPE(nn.Module):
+
+    def __init__(self, d_head): # rope changes qk after it is split by attn heads
+        super().__init__()
+
+        self.dim = d_head 
+        self.ctx = config['ctx_len']
+
+        # pre-compute the theta values and store them
+
+        theta = 10000.0 ** (-2.0 * torch.arange(0, self.dim, 2).float() / self.dim)
+        t = torch.arange(self.ctx, dtype=torch.float)
+
+        # shapes t -> (ctx_len, 1), theta -> (1, dim/2) broadcast (ctx_len, dim/2)
+        freqs = t.unsqueeze(1) * theta.unsqueeze(0)
+
+        # complex number trick, (cos th + i * sin th)
+        freq_cis = torch.polar(torch.ones_like(freqs), freqs)
+
+        self.register_buffer('freq_cis', freq_cis)
+
+    def forward(self, x):
+
+        B, nh, T, hs = x.shape # input is B, nh, T, hs
+
+        x_complex = torch.view_as_complex(x.float().reshape(B, nh, T, hs//2, 2)) # split into 2 groups 
+
+        freq_cis = self.freq_cis[:T].view(1, 1, T, -1)
+
+        x_rot_complex = x_complex * freq_cis
+
+        x_rot = torch.view_as_real(x_rot_complex)
+        x_out = x_rot.reshape(B, nh, T, hs)
+
+        return x_out.type_as(x)
+
 class CasualSelfAttn(nn.Module):
 
     def __init__(self):
@@ -34,6 +70,8 @@ class CasualSelfAttn(nn.Module):
         self.dropout = config['dropout']
         self.block_size = config['ctx_len']
 
+        self.rope = RoPE(self.n_embd//self.n_head) # setup
+
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
@@ -47,8 +85,13 @@ class CasualSelfAttn(nn.Module):
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
 
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        
+        # qk rope
+        q = self.rope(q) 
+        k = self.rope(k)
+
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
@@ -109,8 +152,8 @@ class Transformer(nn.Module):
         self.block_size = config['ctx_len']
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config['vocab_size'], config['n_embd']),
-            wpe = nn.Embedding(self.block_size, config['n_embd']),
+            wte = nn.Embedding(config['vocab_size'], config['n_embd']), # tok embd
+            wpe = nn.Embedding(self.block_size, config['n_embd']), # pos embd
             drop = nn.Dropout(config['dropout']),
             h = nn.ModuleList([Block() for _ in range(config['n_layer'])]),
             ln_f = nn.LayerNorm(config['n_embd'], bias=config.get('bias', False)), # Use bias from config
