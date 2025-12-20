@@ -6,112 +6,116 @@ import model
 from model import Transformer
 
 # =========================
-# config
+# 1. Config & Setup
 # =========================
 model.config["vocab_size"] = 8192
 model.config["block_size"] = 1024
 
-batch_size = 8
-block_size = 1024
-grad_accum_steps = 4
-qat_steps = 20000
-lr = 5e-6
-beta1, beta2 = 0.99, 0.95
-weight_decay = 0.02
-max_grad_norm = 0.3
-group_size = 16  
+batch_size = 16      # Context 1024 is heavy, keep batch small
+block_size = 1024   
+grad_accum_steps = 8 
+qat_steps = 100
+lr = 4e-5           # Moderate recovery LR
+max_grad_norm = 1.0 
+group_size = 64  
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# CHANGE: Set dtype to float32
-dtype = torch.float32 
+# MAKE SURE THIS PATH IS 100% CORRECT
+fp16_checkpoint = "/content/floppyLLM/checkpoints/C19KBM_7000.pt"
+tokenizer = AutoTokenizer.from_pretrained("nano_1k")
 
-fp16_checkpoint = "/content/floppyLLM/checkpoints/1pp88e_inference_fp16.pt"
 data_dir = "synth_2"
 
 # =========================
-# fake int4 with stochastic rounding + learnable per-channel scale
+# 2. Fake Int4 Module
 # =========================
 class FakeInt4Weight(torch.nn.Module):
-    def __init__(self, group_size=16, learnable_scale=True, eps=1e-4): # Slightly higher eps for stability
+    def __init__(self, group_size=64, eps=1e-4):
         super().__init__()
         self.group_size = group_size
-        self.learnable_scale = learnable_scale
         self.scale_param = None
         self.eps = eps 
 
     def forward(self, w):
-        shape = w.shape
+        w = w.float()
         w_flat = w.view(-1, self.group_size)
-        
-        # 1. Calculate Scale
         scale = w_flat.abs().max(dim=1, keepdim=True)[0].clamp(min=self.eps)
-        if self.learnable_scale:
-            if self.scale_param is None or self.scale_param.shape[0] != scale.shape[0]:
-                init_val = torch.log(torch.exp(scale) - 1)
-                self.scale_param = torch.nn.Parameter(init_val)
-            scale = torch.nn.functional.softplus(self.scale_param)
-
-        # 2. Quantize (Deterministic is better for this small model)
-        # Normalize to [-1, 1], scale to [-7, 7], then round
+        if self.scale_param is None or self.scale_param.shape[0] != scale.shape[0]:
+            init_val = torch.log(torch.exp(scale) - 1 + 1e-6)
+            self.scale_param = torch.nn.Parameter(init_val)
+        
+        scale = torch.nn.functional.softplus(self.scale_param)
         w_norm = w_flat / scale
         q = torch.clamp(torch.round(w_norm * 7), -8, 7)
-        
-        # 3. Dequantize
-        w_quant = (q / 7 * scale).view(shape)
-
-        # 4. THE STE TRICK (Crucial)
-        # This makes the forward pass use 'w_quant' 
-        # but the backward pass skip the rounding and act on 'w' directly.
+        w_quant = (q / 7 * scale).view(w.shape)
+        # Straight-Through Estimator
         return w + (w_quant - w).detach()
 
-def enable_int4_qat(model, group_size=16):
-    for m in model.modules():
+def enable_int4_qat(model, group_size=64):
+    for n, m in model.named_modules():
+        # EXCLUDE Embeddings and Head - Keep them high-precision
+        if any(x in n for x in ["wte", "wpe", "lm_head"]):
+            print(f"Excluding from QAT: {n}")
+            continue
+            
         if isinstance(m, torch.nn.Linear):
-            m.fake_q = FakeInt4Weight(group_size, learnable_scale=True)
+            m.fake_q = FakeInt4Weight(group_size)
             def qat_forward(x, m=m):
-                # Ensure input x is float32
                 wq = m.fake_q(m.weight)
-                return torch.nn.functional.linear(x.float(), wq, m.bias)
+                return torch.nn.functional.linear(x, wq, m.bias)
             m.forward = qat_forward
 
 # =========================
-# minimal int4 export (unchanged)
+# 3. Proper Weight Loading
 # =========================
-def pack_int4(q: torch.Tensor) -> torch.Tensor:
-    q = (q + 8).to(torch.uint8) 
-    if q.shape[1] % 2 != 0:
-        q = torch.cat([q, torch.zeros(q.shape[0], 1, dtype=torch.uint8, device=q.device)], dim=1)
-    return (q[:, 0::2] | (q[:, 1::2] << 4))
+m = Transformer().to(device)
+m.float() 
 
-def export_int4_minimal(model, group_size=16):
-    sd = {}
-    for k, v in model.state_dict().items():
-        if k == "lm_head.weight": continue 
-        if torch.is_complex(v): continue
-        if "bias" in k or "norm" in k:
-            sd[k] = v.half()
-            continue
-        if k == "transformer.wte.weight":
-            w = v.float()
-            scale = w.abs().max(dim=1, keepdim=True)[0].clamp(min=1e-2)
-            q = torch.round(w / scale * 7).clamp(-8,7).to(torch.int8)
-            sd[k + ".int4"] = pack_int4(q)
-            sd[k + ".scale"] = scale.half()
-            sd["lm_head.weight.int4"] = sd[k + ".int4"]
-            sd["lm_head.weight.scale"] = sd[k + ".scale"]
-            continue
-        if v.ndim >= 2 and v.dtype.is_floating_point:
-            w = v.float().view(-1, group_size)
-            scale = w.abs().max(dim=1, keepdim=True)[0].clamp(min=1e-2)
-            q = torch.round(w / scale * 7).clamp(-8,7).to(torch.int8)
-            sd[k + ".int4"] = pack_int4(q)
-            sd[k + ".scale"] = scale.half()
-            continue
-        sd[k] = v.half() if v.dtype.is_floating_point else v
-    return sd
+print(f"Attempting to load: {fp16_checkpoint}")
+checkpoint = torch.load(fp16_checkpoint, map_location=device)
+
+# --- THE FIX: Strip 'compiled' prefix if it exists ---
+state_dict = checkpoint.get('model', checkpoint) # Handle full ckpt or just state_dict
+unwanted_prefix = '_orig_mod.'
+for k,v in list(state_dict.items()):
+    if k.startswith(unwanted_prefix):
+        state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+
+# Force strict=True to find out EXACTLY why it's failing if it does
+try:
+    m.load_state_dict(state_dict, strict=True)
+    print("Checkpoint loaded successfully with strict=True")
+except RuntimeError as e:
+    print(f"Loading failed! Error: {e}")
+    print("Attempting fix with strict=False...")
+    m.load_state_dict(state_dict, strict=False)
+
+# DIAGNOSTIC: Check if weights are random or trained
+# (Random weights are usually very small, e.g., 0.02. Trained are larger)
+print(f"Weight Check (wte): {m.transformer.wte.weight[0, :5].tolist()}")
 
 # =========================
-# data loader (tokens cast to long)
+# 4. QAT Logic
+# =========================
+enable_int4_qat(m, group_size=group_size)
+
+m.train()
+# Calibration
+print("Calibrating...")
+with torch.no_grad():
+    # We'll use a manual tiny batch for calibration to ensure scales exist
+    dummy_x = torch.randint(0, 8192, (1, 1024), device=device)
+    _ = m(dummy_x)
+
+scale_params = [p for n, p in m.named_parameters() if "scale_param" in n]
+other_params = [p for n, p in m.named_parameters() if "scale_param" not in n]
+opt = torch.optim.AdamW([
+    {'params': scale_params, 'lr': lr},
+    {'params': other_params, 'lr': lr}
+], betas=(0.9, 0.95), weight_decay=0.01)
+
+# =========================
+# 5. Data & Loop
 # =========================
 def _load_data_shard(file: Path):
     with file.open("rb") as f:
@@ -120,7 +124,7 @@ def _load_data_shard(file: Path):
     return tokens.long()
 
 def create_data_generator(pattern, batch_size, block_size):
-    files = list(Path(".").glob(pattern))
+    files = sorted(list(Path(".").glob(pattern)))
     it = itertools.cycle(files)
     tokens, pos = None, 0
     while True:
@@ -132,71 +136,36 @@ def create_data_generator(pattern, batch_size, block_size):
         pos += batch_size*block_size
         yield x.to(device), y.to(device)
 
-train_gen = create_data_generator(f"data/{data_dir}/{data_dir}_train_*.bin",
-                                  batch_size, block_size)
+train_gen = create_data_generator(f"data/{data_dir}/{data_dir}_train_*.bin", batch_size, block_size)
 
-# =========================
-# model load & upcast
-# =========================
-m = Transformer().to(device)
+@torch.no_grad()
+def generate_sample(model, steps=128):
+    model.eval()
+    x = torch.tensor([[tokenizer.bos_token_id or 0]], device=device)
+    try:
+        # Use simple greedy for speed during QAT check
+        y = model.generate(x, max_new_tokens=steps, temperature=0.7, top_k=40)
+        out = tokenizer.decode(y[0].tolist())
+    except: out = "Gen error"
+    model.train()
+    return out
 
-# CHANGE: Force model to float32 immediately
-m.float() 
-
-state_dict = torch.load(fp16_checkpoint, map_location="cpu")
-m.load_state_dict(state_dict, strict=False)
-m.train()
-print(f"model params: {sum(p.numel() for p in m.parameters())/1e6:.2f}M (FP32 Mode)")
-
-# freeze norms
-for n, p in m.named_parameters():
-    if "norm" in n.lower():
-        p.requires_grad = False
-
-# enable qat
-enable_int4_qat(m, group_size=group_size)
-
-# split optimizer
-scale_params = [p for n,p in m.named_parameters() if "scale_param" in n]
-other_params = [p for n,p in m.named_parameters() if "scale_param" not in n]
-
-opt = torch.optim.AdamW([
-    {'params': scale_params, 'lr': 1e-6},
-    {'params': other_params}
-], lr=lr, betas=(beta1, beta2), weight_decay=weight_decay)
-
-# REMOVED: Autocast context and GradScaler
-
-# =========================
-# qat loop (FP32 Version)
-# =========================
+print("Starting QAT...")
 for step in range(qat_steps):
     opt.zero_grad(set_to_none=True)
     loss_accum = 0.0
     for _ in range(grad_accum_steps):
         xb, yb = next(train_gen)
-        
-        # NO Autocast here - we want raw FP32
         _, loss = m(xb, yb)
         loss = loss / grad_accum_steps
-        
-        # NO scaler here - standard backward
         loss.backward()
         loss_accum += loss.item()
     
-    # Clip gradients before stepping
     torch.nn.utils.clip_grad_norm_(m.parameters(), max_grad_norm)
-    
-    # Standard optimizer step
     opt.step()
     
+    if step % 10 == 0: # Print every step for now so you can see if it drops
+        print(f"step {step} | loss {loss_accum:.4f}")
+        
     if step % 100 == 0:
-        print(f"qat step {step} | loss {loss_accum:.4f}")
-
-# =========================
-# export int4
-# =========================
-os.makedirs("checkpoints", exist_ok=True)
-out_path = "checkpoints/qat_int4.pt"
-torch.save(export_int4_minimal(m, group_size=group_size), out_path)
-print(f"saved int4 weights → {out_path}")
+        print(f"\nSAMPLE AT STEP {step}:\n{generate_sample(m)}\n")

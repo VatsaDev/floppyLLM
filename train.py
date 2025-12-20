@@ -84,7 +84,7 @@ if not os.path.exists('checkpoints'): os.makedirs('checkpoints')
 if not os.path.exists('plots'): os.makedirs('plots')
 
 # encoding 
-tok = AutoTokenizer.from_pretrained("nano_8k")
+tok = AutoTokenizer.from_pretrained("nano_1k")
 encode = lambda s: tok.encode(s, add_special_tokens=True)
 decode = lambda l: tok.decode(l)
 vocab_size = tok.vocab_size
@@ -377,5 +377,6 @@ for iter_num in range(start_iter, max_iters + 1):
         print(f"Saved optimized inference model to {fp16_inference_path}")
 
 print('Training finished.')
+
 
 
