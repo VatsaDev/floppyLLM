@@ -7,9 +7,9 @@ import inspect
 from normuon import NorMuon
 
 config = {
-    "n_embd": 64,         
-    "n_head": 8, #8            
-    "n_layer": 4, #4         
+    "n_embd": 128,         
+    "n_head": 4,            
+    "n_layer": 8,         
     "dropout": 0.2,         
     "vocab_size": 50257,    # update in train
     "ctx_len": 1024,        # update in train 
@@ -332,3 +332,4 @@ class Transformer(nn.Module):
 
         mfu = flops_achieved / flops_promised
         return mfu
+

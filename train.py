@@ -43,7 +43,7 @@ weight_decay = 1e-1
 max_grad_norm = 1.0 
 
 ckpt_iter = 1000
-resume = True
+resume = False
 resume_checkpoint = "/content/floppyLLM/checkpoints/sVtcrs_10000.pt" 
 data_dir = "synth_2"
 
@@ -377,4 +377,5 @@ for iter_num in range(start_iter, max_iters + 1):
         print(f"Saved optimized inference model to {fp16_inference_path}")
 
 print('Training finished.')
+
 
