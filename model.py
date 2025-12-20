@@ -116,7 +116,7 @@ class CasualSelfAttn(nn.Module):
 # Swiglu replaces MLP 
 
 class MLP(nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim):
+    def __init__(self):
         super().__init__()
 
         n = int((8/3) * config['n_embd'])
@@ -124,7 +124,7 @@ class MLP(nn.Module):
 
         # combine gate and value
         self.gate_value_proj = nn.Linear(config['n_embd'], 2 * appr, bias=False) # Llama uses no bias
-        self.linear_out = nn.Linear(appr, config[n_embd], bias=False)
+        self.linear_out = nn.Linear(appr, config['n_embd'], bias=False)
         self.silu = nn.SiLU()
 
         self.dropout = nn.Dropout(config['dropout'])
