@@ -29,7 +29,7 @@ grad_accum_steps = 4 # basically microbatch
 lr = 1e-3
 min_lr = 1e-4
 
-max_iters = 10001
+max_iters = 100001
 eval_iters = 20
 warmup_iters = 10 
 
@@ -43,8 +43,8 @@ weight_decay = 1e-1
 max_grad_norm = 1.0 
 
 ckpt_iter = 1000
-resume = False
-resume_checkpoint = "checkpoints/example.pt" 
+resume = True
+resume_checkpoint = "/content/floppyLLM/checkpoints/sVtcrs_10000.pt" 
 data_dir = "synth_2"
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -190,6 +190,9 @@ if resume:
     train_losses_history = checkpoint.get('train_losses_history', [])
     val_losses_history = checkpoint.get('val_losses_history', [])
 
+    train_losses_history = [x.item() if isinstance(x, torch.Tensor) else x for x in train_losses_history]
+    val_losses_history = [x.item() if isinstance(x, torch.Tensor) else x for x in val_losses_history]
+
 else:
     model_instance = Transformer()
     m = model_instance.to(device)
@@ -225,7 +228,7 @@ def estimate_loss(model_to_eval, data_gens):
             with ctx:
                 logits, loss = model_to_eval(X, Y)
             losses[k] = loss.item()
-        out[split] = losses.mean()
+        out[split] = losses.mean().item()
     return out
 
 @torch.no_grad()
@@ -288,7 +291,7 @@ for iter_num in range(start_iter, max_iters + 1):
         
         # --- Plotting ---
         plt.figure(figsize=(8, 4), dpi=100)
-        iterations_eval = range(0, iter_num + 1, eval_interval)
+        iterations_eval = [i * eval_interval for i in range(len(val_losses_history))]
         iterations_train = range(len(train_losses_history)) 
         
         if len(train_losses_history) > 0:
@@ -374,3 +377,4 @@ for iter_num in range(start_iter, max_iters + 1):
         print(f"Saved optimized inference model to {fp16_inference_path}")
 
 print('Training finished.')
+
