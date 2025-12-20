@@ -113,30 +113,41 @@ class CasualSelfAttn(nn.Module):
         
         return y
 
-class MLP(nn.Module):
+# Swiglu replaces MLP 
 
-    def __init__(self):
+class MLP(nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim):
         super().__init__()
-        
-        self.c_fc    = nn.Linear(config['n_embd'], 4 * config['n_embd'], bias=config['bias']) # Use bias from config
-        self.gelu    = nn.GELU(approximate='tanh') # approx faster
-        self.c_proj  = nn.Linear(4 * config['n_embd'], config['n_embd'], bias=config.get('bias', False)) # Use bias from config
+
+        n = int((8/3) * config['n_embd'])
+        appr = (n + 63) & ~(63) # make it a multiple of 64
+
+        # combine gate and value
+        self.gate_value_proj = nn.Linear(config['n_embd'], 2 * appr, bias=False) # Llama uses no bias
+        self.linear_out = nn.Linear(appr, config[n_embd], bias=False)
+        self.silu = nn.SiLU()
+
         self.dropout = nn.Dropout(config['dropout'])
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
+        
+        # project input to 2 * appr, split the tensor in half, gate and val
+        gate_value = self.gate_value_proj(x)
+        gate, value = torch.chunk(gate_value, 2, dim=-1)
+
+        x = self.silu(gate) * value
+        x = self.linear_out(x)
         x = self.dropout(x)
+
         return x
 
 class Block(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config['n_embd'], bias=config.get('bias', False))
+        self.ln_1 = nn.LayerNorm(config['n_embd'], bias=False)
         self.attn = CasualSelfAttn()
-        self.ln_2 = nn.LayerNorm(config['n_embd'], bias=config.get('bias', False))
+        self.ln_2 = nn.LayerNorm(config['n_embd'], bias=False)
         self.mlp = MLP()
 
     def forward(self, x):
@@ -156,7 +167,7 @@ class Transformer(nn.Module):
             wpe = nn.Embedding(self.block_size, config['n_embd']), # pos embd
             drop = nn.Dropout(config['dropout']),
             h = nn.ModuleList([Block() for _ in range(config['n_layer'])]),
-            ln_f = nn.LayerNorm(config['n_embd'], bias=config.get('bias', False)), # Use bias from config
+            ln_f = nn.LayerNorm(config['n_embd'], bias=False), # Use bias from config
         ))
 
         self.lm_head = nn.Linear(config['n_embd'], config['vocab_size'], bias=False)
