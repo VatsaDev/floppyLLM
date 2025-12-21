@@ -45,7 +45,7 @@ max_grad_norm = 1.0
 ckpt_iter = 1000
 resume = False
 resume_checkpoint = "/content/floppyLLM/checkpoints/sVtcrs_10000.pt" 
-data_dir = "synth_2"
+data_dir = "synth_3"
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 

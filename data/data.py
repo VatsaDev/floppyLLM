@@ -1,105 +1,119 @@
 import os
+import glob
 import pickle
 import numpy as np
-import glob
+import multiprocessing as mp
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-# --- Setup ---
-tok_path = "../nano_8k" 
-tok = AutoTokenizer.from_pretrained(tok_path)
-
-# --- Hyperparameters ---
-shard_size = 10_000_000  # 1 million tokens per shard
-dataset_path = "synth_2"
-
+# --- Setup & Hyperparameters ---
+tok_path = "../nano_1k" 
+dataset_path = "synth_3"
 DATA_CACHE_DIR = dataset_path
+shard_size = 10_000_000  # 10 million tokens per shard
+num_workers = 1         # Use 10 cores
 
-print(dataset_path)
+# Global tokenizer variable for workers (initialized once per process)
+tokenizer = None
 
-input_files = glob.glob(os.path.join(dataset_path, "*.txt"))
+def init_worker(path):
+    global tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(path)
 
-if not input_files:
-    print(f"Error: No .txt files found in {dataset_path}")
-    exit()
+def tokenize_worker(file_path):
+    """Worker function: reads a file and returns a list of token IDs."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+        # Add special tokens (BOS/EOS) as per your original script
+        return tokenizer.encode(text, add_special_tokens=True)
+    except Exception as e:
+        print(f"Error processing {file_path}: {e}")
+        return []
 
-print(f"Found {len(input_files)} files. Tokenizing...")
-
-# list to collect tokens, convert to numpy
-all_ids_list = []
-
-for file_path in tqdm(input_files, desc="Reading & Tokenizing"):
-    with open(file_path, 'r', encoding='utf-8') as f:
-        text = f.read()
-    
-    # tokenizer to handle special tokens (EOS/BOS)
-    ids = tok.encode(text, add_special_tokens=True)
-    
-    all_ids_list.extend(ids)
-    
-# Convert to numpy array (uint16 is good for vocab < 65535)
-print(f"Converting to Numpy array (Current vocab size: {tok.vocab_size})...")
-all_ids_np = np.array(all_ids_list, dtype=np.uint16)
-print(f"Total tokens: {len(all_ids_np)}")
-
-# train/val
-n = len(all_ids_np)
-split_idx = int(n * 0.9)
-train_ids = all_ids_np[:split_idx]
-val_ids = all_ids_np[split_idx:]
-
-# Sharding Logic
 def write_datafile(filename, data_shard):
-
+    """Writes a shard with the specific 256-byte header format."""
     header = np.zeros(256, dtype=np.int32)
-    header[0] = 20240520 # magic
-    header[1] = 1        # version
-    header[2] = len(data_shard) # number of tokens in this shard
+    header[0] = 20240520        # magic
+    header[1] = 1               # version
+    header[2] = len(data_shard) # number of tokens
     
     with open(filename, "wb") as f:
         f.write(header.tobytes())
         f.write(data_shard.tobytes())
 
-def shard_dataset(ids, split_name):
-    # Calculate how many shards
-    num_shards = int(np.ceil(len(ids) / shard_size))
+def process_split(files, split_name):
+    """Streams tokens from workers and writes shards when buffer is full."""
+    print(f"Processing {len(files)} files for {split_name} split...")
     
-    print(f"Writing {split_name} data into {num_shards} shards...")
+    token_buffer = []
+    shard_count = 0
     
-    for i in tqdm(range(num_shards), desc=f"Sharding {split_name}"):
-        start_idx = i * shard_size
-        end_idx = min((i + 1) * shard_size, len(ids))
+    # Use imap to stream results back as soon as a worker finishes a file
+    with mp.Pool(num_workers, initializer=init_worker, initargs=(tok_path,)) as pool:
+        pbar = tqdm(total=len(files), desc=f"Tokenizing {split_name}")
         
-        shard_data = ids[start_idx:end_idx]
-        
-        filename = os.path.join(DATA_CACHE_DIR, f"{dataset_path}_{split_name}_{i:06d}.bin")
+        for ids in pool.imap(tokenize_worker, files):
+            token_buffer.extend(ids)
+            
+            # If buffer exceeds shard_size, write out shards
+            while len(token_buffer) >= shard_size:
+                shard_data = np.array(token_buffer[:shard_size], dtype=np.uint16)
+                filename = os.path.join(DATA_CACHE_DIR, f"{dataset_path}_{split_name}_{shard_count:06d}.bin")
+                write_datafile(filename, shard_data)
+                
+                shard_count += 1
+                token_buffer = token_buffer[shard_size:] # Remove written tokens
+            
+            pbar.update(1)
+        pbar.close()
+
+    # Write any remaining tokens as the final (smaller) shard
+    if token_buffer:
+        shard_data = np.array(token_buffer, dtype=np.uint16)
+        filename = os.path.join(DATA_CACHE_DIR, f"{dataset_path}_{split_name}_{shard_count:06d}.bin")
         write_datafile(filename, shard_data)
 
-shard_dataset(train_ids, "train")
-shard_dataset(val_ids, "val")
+if __name__ == "__main__":
+    # 1. Setup Directory
+    os.makedirs(DATA_CACHE_DIR, exist_ok=True)
+    input_files = sorted(glob.glob(os.path.join(dataset_path, "*.txt")))
+    
+    if not input_files:
+        print(f"Error: No .txt files found in {dataset_path}")
+        exit()
 
-meta = {
-    'vocab_size': tok.vocab_size,
-    'tokenizer_path': tok_path, 
-    'vocab_source': 'custom_bpe' 
-}
+    # 2. Train/Val Split (90/10)
+    n = len(input_files)
+    split_idx = int(n * 0.9)
+    train_files = input_files[:split_idx]
+    val_files = input_files[split_idx:]
 
-meta_pkl_path = os.path.join(DATA_CACHE_DIR, 'meta.pkl')
-with open(meta_pkl_path, 'wb') as f:
-    pickle.dump(meta, f)
+    # 3. Process each split
+    process_split(train_files, "train")
+    process_split(val_files, "val")
 
-print(f"Done! Dataset ready in: {DATA_CACHE_DIR}")
+    # 4. Save Meta Information
+    # Initialize tokenizer once in main to get vocab size
+    tok = AutoTokenizer.from_pretrained(tok_path)
+    meta = {
+        'vocab_size': tok.vocab_size,
+        'tokenizer_path': tok_path, 
+        'vocab_source': 'custom_bpe' 
+    }
+    with open(os.path.join(DATA_CACHE_DIR, 'meta.pkl'), 'wb') as f:
+        pickle.dump(meta, f)
 
-gitignore_path = '../.gitignore' # Adjusted path assuming script is running closer to root, adjust if needed
-dataset_gitignore_entry = f"{dataset_path}/\n"
+    # 5. Gitignore Update
+    gitignore_path = '../.gitignore'
+    entry = f"{dataset_path}/\n"
+    if os.path.exists(gitignore_path):
+        with open(gitignore_path, 'r') as f:
+            if entry not in f.readlines():
+                with open(gitignore_path, 'a') as f:
+                    f.write(entry)
+    else:
+        with open(gitignore_path, 'w') as f:
+            f.write(entry)
 
-if os.path.exists(gitignore_path):
-    with open(gitignore_path, 'r') as f:
-        lines = f.readlines()
-    if dataset_gitignore_entry not in lines:
-        with open(gitignore_path, 'a') as f:
-            f.write(dataset_gitignore_entry)
-            print(f"Added to .gitignore")
-else:
-    with open(gitignore_path, 'w') as f:
-        f.write(dataset_gitignore_entry)
+    print(f"Done! Dataset ready in: {DATA_CACHE_DIR}")

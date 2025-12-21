@@ -5,8 +5,8 @@ from tqdm import tqdm
 
 # --- Configuration ---
 DATASET_NAME = "PleIAs/SYNTH"
-OUTPUT_DIR = "synth_2"
-MAX_ROWS = 1_000_000  # Stop after processing this many entries
+OUTPUT_DIR = "synth_3"
+MAX_ROWS = 5_000_000  # Stop after processing this many entries
 MAX_FILE_SIZE_BYTES = 1024 * 1024 * 50  # 50mb
 
 # --- The Scrubber Configuration ---
