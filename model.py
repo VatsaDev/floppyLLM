@@ -143,9 +143,9 @@ class Block(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config['n_embd'], bias=False)
+        self.ln_1 = nn.RMSNorm(config['n_embd'])
         self.attn = CasualSelfAttn()
-        self.ln_2 = nn.LayerNorm(config['n_embd'], bias=False)
+        self.ln_2 = nn.RMSNorm(config['n_embd'])
         self.mlp = MLP()
 
     def forward(self, x):
@@ -165,7 +165,7 @@ class Transformer(nn.Module):
             wpe = nn.Embedding(self.block_size, config['n_embd']), # pos embd
             drop = nn.Dropout(config['dropout']),
             h = nn.ModuleList([Block() for _ in range(config['n_layer'])]),
-            ln_f = nn.LayerNorm(config['n_embd'], bias=False), # Use bias from config
+            ln_f = nn.RMSNorm(config['n_embd']), # Use bias from config
         ))
 
         self.lm_head = nn.Linear(config['n_embd'], config['vocab_size'], bias=False)

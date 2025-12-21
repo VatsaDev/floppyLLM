@@ -97,55 +97,55 @@ def pack_int4(q):
 import numpy as np
 
 def export_int4_blob(model, group_size, path, target_vocab=1024):
+    print(f"Creating raw binary blob (Protecting Dictionary)...")
     if hasattr(model, '_orig_mod'): model = model._orig_mod
     current_sd = model.state_dict()
     
-    # 1. Prepare to store raw bytes
     weight_bytes = bytearray()
     scale_bytes = bytearray()
     
-    # 2. Prepare a small metadata dict for Norms, Biases, and Shapes
     metadata = {
         "group_size": group_size,
         "weight_order": [], 
         "high_prec_params": {} 
     }
 
+    # Sort keys to ensure deterministic order
     for k in sorted(current_sd.keys()):
         v = current_sd[k]
         if any(x in k for x in ["scale_param", "lm_head.weight"]): continue
         
-        # Heavy Weights (Linear & Embedding)
-        if v.ndim >= 2 and v.dtype.is_floating_point:
-            if "wte.weight" in k: v = v[:target_vocab, :].clone()
-            
-            # Quantize
+        # --- LOGIC WEIGHTS (Hidden Layers) ---
+        # We only quantize if it's a weight matrix AND NOT an embedding
+        if v.ndim >= 2 and not any(x in k for x in ["wte", "wpe"]):
             w_flat = v.float().view(-1, group_size)
+            
+            # Use learned scale
             scale_name = k.replace(".weight", ".fake_q.scale_param")
-            scale = torch.nn.functional.softplus(current_sd[scale_name]) if scale_name in current_sd else w_flat.abs().max(dim=1, keepdim=True)[0].clamp(min=1e-2)
+            scale = torch.nn.functional.softplus(current_sd[scale_name])
             
             # Pack
             q = torch.round(w_flat / scale * 7).clamp(-8, 7).to(torch.int8)
             q_u = (q + 8).cpu().numpy().astype(np.uint8)
             packed = (q_u[0::2] | (q_u[1::2] << 4)).flatten()
             
-            # Add to blob
             weight_bytes.extend(packed.tobytes())
             scale_bytes.extend(scale.half().cpu().numpy().tobytes())
-            
             metadata["weight_order"].append((k, v.shape))
+            
         else:
-            # Norms, Biases, WPE stay in high precision metadata
-            metadata["high_prec_params"][k] = v.half().cpu()
+            # --- HIGH PRECISION (Embeddings, Norms, Biases) ---
+            val = v.clone()
+            if "wte.weight" in k: val = val[:target_vocab, :] # Slice vocab
+            metadata["high_prec_params"][k] = val.half().cpu()
 
-    # Write the Big Blob
+    # Write files
     with open(path, "wb") as f:
         f.write(weight_bytes)
         f.write(scale_bytes)
-        
-    # Write the Metadata (Small .pt file)
     torch.save(metadata, path + ".meta")
-    print(f"✅ Blob: {os.path.getsize(path)/1e6:.2f}MB | Meta: {os.path.getsize(path+'.meta')/1e6:.2f}MB")
+    
+    print(f"✅ Exported. Blob: {os.path.getsize(path)/1e6:.2f}MB | Meta: {os.path.getsize(path+'.meta')/1e6:.2f}MB")
 
 # =========================
 # 4. Training Utilities
