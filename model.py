@@ -1,4 +1,4 @@
-import math
+import math 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -330,5 +330,6 @@ class Transformer(nn.Module):
 
         mfu = flops_achieved / flops_promised
         return mfu
+
 
 

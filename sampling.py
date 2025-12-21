@@ -41,55 +41,108 @@
 # Dynamic Temp
 # - https://github.com/ggerganov/llama.cpp/issues/3483
 
-import os
 import torch
-import pickle
-from contextlib import nullcontext
+import numpy as np
+import torch.nn as nn
+from torch.nn import functional as F
+from transformers import AutoTokenizer
+import model # Assumes your model.py is in the directory
 
-from model import Transformer
-
-
+# =========================
+# 1. Inference Config
+# =========================
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-ckpath = 'checkpoints\check_200.pt'
+checkpoint_path = "/content/floppyLLM/checkpoints/qat_final_tiny.pt"
+tokenizer_path = "nano_1k" 
+tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
-# load model
+# =========================
+# 2. The Unpacking Engine
+# =========================
 
-checkpoint = torch.load(ckpath, map_location=device)
-model = Transformer()
+def load_from_raw_blob(blob_path, model_instance):
+    device = next(model_instance.parameters()).device
+    meta_path = blob_path + ".meta"
+    
+    print(f"Reading metadata from {meta_path}...")
+    meta = torch.load(meta_path, map_location='cpu', weights_only=False)
+    group_size = meta["group_size"]
+    
+    # 1. Load high-precision params (Norms/Biases)
+    model_instance.load_state_dict(meta["high_prec_params"], strict=False)
 
-state_dict = checkpoint['model']
-model.load_state_dict(state_dict)
+    # 2. Load the Raw Blob into memory
+    print(f"Reading raw bytes from {blob_path}...")
+    with open(blob_path, "rb") as f:
+        full_blob = f.read()
 
-model.eval()
-model.to(device)
+    # 3. Logic to slice the blob
+    # First half of file is weights, second half is scales (based on your export)
+    # We calculate the total weight bytes needed
+    total_weight_bytes = sum(((s.numel() + 1) // 2) for _, s in meta["weight_order"])
+    
+    weight_data = np.frombuffer(full_blob[:total_weight_bytes], dtype=np.uint8)
+    scale_data = np.frombuffer(full_blob[total_weight_bytes:], dtype=np.float16)
+    
+    w_ptr = 0
+    s_ptr = 0
+    sd = model_instance.state_dict()
 
-ctx = nullcontext() if device == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+    for name, shape in meta["weight_order"]:
+        num_el = shape.numel()
+        bytes_needed = (num_el + 1) // 2
+        
+        # Unpack the 4-bit pairs
+        chunk = weight_data[w_ptr : w_ptr + bytes_needed]
+        low = chunk & 0x0F
+        high = chunk >> 4
+        unpacked = np.stack([low, high], axis=1).flatten()[:num_el]
+        
+        # Dequantize
+        num_groups = num_el // group_size
+        scales = scale_data[s_ptr : s_ptr + num_groups].reshape(-1, 1)
+        
+        # Convert to torch and apply math
+        weights = (torch.from_numpy(unpacked).float() - 8).to(device)
+        scales_t = torch.from_numpy(scales).to(device)
+        
+        final_w = (weights.view(-1, group_size) * scales_t).view(shape)
+        sd[name].copy_(final_w)
+        
+        w_ptr += bytes_needed
+        s_ptr += num_groups
 
-# tokenizer
+    # Re-tie head
+    model_instance.lm_head.weight = model_instance.transformer.wte.weight
+    print("✅ Blob Unpacked. Model is ready for sampling.")
+    return model_instance
 
-with open('data/meta.pkl', 'rb') as f:
-    meta = pickle.load(f)
+# =========================
+# 3. Execution Logic
+# =========================
+from model import Transformer, config
 
-stoi, itos = meta['stoi'], meta['itos']
-encode = lambda s: [stoi[c] for c in s]
-decode = lambda l: ''.join([itos[i] for i in l])
+# Match your pencil-thin config
+config["vocab_size"] = 1024
+config["n_embd"] = 64
+config["n_layer"] = 40
+config["n_head"] = 2
 
-# actual generation
+m = Transformer().to(device).half() # Inference in FP16 for speed
+m = load_from_raw_blob(checkpoint_path, m)
+m.eval()
 
-start = " " 
-start_ids = encode(start)
+# --- TEXT GENERATION ---
+def generate(prompt, max_tokens=100):
+    idx = torch.tensor(tokenizer.encode(prompt), device=device).unsqueeze(0)
+    
+    print(f"\nPrompt: {prompt}\n" + "-"*30)
+    
+    # Use the model's built-in generate method
+    with torch.no_grad():
+        completion = m.generate(idx, max_new_tokens=max_tokens, temperature=0.8, top_k=40)
+    
+    return tokenizer.decode(completion[0].tolist())
 
-num_samples = 5
-max_new_tokens = 100
-
-x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
-
-# run generation
-with torch.no_grad():
-    with ctx:
-        for k in range(num_samples):
-            y = model.generate(x, max_new_tokens)
-
-            print(f'\nExample {k+1}:')
-            print(decode(y[0].tolist()))
-            print('\n')
+# Run it!
+print(generate("In the year 2025,"))
