@@ -72,6 +72,7 @@ class CasualSelfAttn(nn.Module):
 
         self.q_norm = nn.RMSNorm(self.n_embd//self.n_head) 
         self.k_norm = nn.RMSNorm(self.n_embd//self.n_head)
+        self.v_norm = nn.RMSNorm(self.n_embd//self.n_head)
 
         self.rope = RoPE(self.n_embd//self.n_head)
 
@@ -96,6 +97,7 @@ class CasualSelfAttn(nn.Module):
 
         q = self.q_norm(q)
         k = self.k_norm(k)
+        v = self.v_norm(v)
 
         # qk rope
         q = self.rope(q) 
