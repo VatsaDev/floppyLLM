@@ -6,7 +6,7 @@ import inspect
 
 config = {
     "n_embd": 80,         
-    "n_head": 1, # at higher depths, more heads is considered better?            
+    "n_head": 2, # at higher depths, more heads is considered better?            
     "n_layer": 50,         
     "dropout": 0.2,         
     "vocab_size": 50257,    # update in train
