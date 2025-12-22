@@ -42,68 +42,227 @@
 # - https://github.com/ggerganov/llama.cpp/issues/3483
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from transformers import AutoTokenizer
-from model import Transformer, config
+import model
+from model import Transformer
 
-def load_blob_inference(blob_path, meta_path, model_instance):
-    device = next(model_instance.parameters()).device
-    meta = torch.load(meta_path, map_location='cpu', weights_only=False)
-    high_prec = meta["high_prec_params"]
-    model_sd = model_instance.state_dict()
+# Config must match training
+config = {
+    "n_embd": 64,
+    "n_head": 2,
+    "n_layer": 40,
+    "dropout": 0.0,
+    "vocab_size": 1024,
+    "ctx_len": 1024,
+    "bias": False,
+}
+model.config.update(config)
 
-    # 1. Inject High-Precision (Embeddings/Norms)
-    for mk, weight in high_prec.items():
-        clean_mk = mk.replace('_orig_mod.', '')
-        for rk in model_sd.keys():
-            if clean_mk == rk.replace('_orig_mod.', ''):
-                model_sd[rk].copy_(weight.to(device))
-                break
-
-    # 2. Unpack Logic Blob
-    with open(blob_path, "rb") as f: full_blob = f.read()
-    group_size = meta["group_size"]
-    total_w_bytes = sum(((s.numel() + 1) // 2) for _, s in meta["weight_order"])
-    weight_data = np.frombuffer(full_blob[:total_w_bytes], dtype=np.uint8)
-    scale_data = np.frombuffer(full_blob[total_w_bytes:], dtype=np.float16)
-    
-    w_ptr, s_ptr = 0, 0
-    for name, shape in meta["weight_order"]:
-        num_el = shape.numel()
-        bytes_needed = (num_el + 1) // 2
-        chunk = weight_data[w_ptr : w_ptr + bytes_needed]
-        
-        low, high = chunk & 0x0F, chunk >> 4
-        unpacked = np.stack([low, high], axis=1).flatten()[:num_el]
-        
-        scales = scale_data[s_ptr : s_ptr + (num_el // group_size)].reshape(-1, 1)
-        w_t = (torch.from_numpy(unpacked).float() - 8).to(device)
-        s_t = torch.from_numpy(scales).to(device)
-        
-        # FIX: The / 7.0 math MUST match your FakeInt4Weight training math!
-        final_w = ((w_t.view(-1, group_size) / 7.0) * s_t).view(shape)
-        
-        target_key = name if name in model_sd else "_orig_mod." + name
-        if target_key in model_sd: model_sd[target_key].copy_(final_w)
-        
-        w_ptr += bytes_needed
-        s_ptr += (num_el // group_size)
-
-    model_instance.lm_head.weight = model_instance.transformer.wte.weight
-    strength = model_instance.transformer.wte.weight.abs().mean().item()
-    print(f"✅ Ready. Embedding Strength: {strength:.4f}")
-    return model_instance
-
-# Setup and Run
-config["vocab_size"], config["n_embd"], config["n_layer"] = 1024, 64, 40
+device = "cuda" if torch.cuda.is_available() else "cpu"
 tokenizer = AutoTokenizer.from_pretrained("nano_1k")
-m = Transformer().to(device)
-m = load_blob_inference("checkpoints/qat_final_tiny.pt", "checkpoints/qat_final_tiny.pt.meta", m)
-m.eval()
 
-# Generate
-prompt = "In the future,"
-idx = torch.tensor(tokenizer.encode(prompt), device=device).unsqueeze(0)
-with torch.no_grad():
-    out = m.generate(idx, max_new_tokens=100, temperature=0.7, top_k=40)
-print(tokenizer.decode(out[0].tolist()))
+# =========================
+# BitLinear for Inference
+# =========================
+class BitLinearInference(nn.Module):
+    """ Inference-only BitLinear with fixed ternary weights """
+    def __init__(self, in_features, out_features, ternary_weights, scale, bias=None):
+        super().__init__()
+        # Store weights as int8 for memory efficiency
+        self.register_buffer('weight_ternary', ternary_weights.to(torch.int8))
+        self.register_buffer('weight_scale', torch.tensor([scale]))
+        self.bias = nn.Parameter(bias) if bias is not None else None
+        self.in_features = in_features
+        self.out_features = out_features
+        
+    def forward(self, x):
+        # Reconstruct FP weights from ternary
+        w = self.weight_ternary.float() * self.weight_scale
+        
+        # Simple 8-bit activation quantization for speed
+        x_scale = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
+        x_quant = torch.round(torch.clamp(x / x_scale * 127, -128, 127))
+        x_final = x_quant * x_scale / 127
+        
+        return F.linear(x_final, w, self.bias)
+
+# =========================
+# Unpacking Functions
+# =========================
+def unpack_ternary_base3(data, target_shape):
+    """ Unpacks base-3 encoded ternary weights """
+    arr = np.frombuffer(data, dtype=np.uint8).astype(np.uint64)
+    
+    # Decode base-3: each byte stores 5 ternary values
+    total_vals = len(arr) * 5
+    w = np.zeros(total_vals, dtype=np.int8)
+    w[0::5] = arr % 3
+    w[1::5] = (arr // 3) % 3
+    w[2::5] = (arr // 9) % 3
+    w[3::5] = (arr // 27) % 3
+    w[4::5] = (arr // 81) % 3
+    
+    # Map {0,1,2} back to {-1,0,1}
+    w = w - 1
+    
+    # Reshape and return
+    num_elements = np.prod(target_shape)
+    return torch.from_numpy(w[:num_elements].reshape(target_shape))
+
+def load_bitnet_model(bin_path, meta_path):
+    """ Load BitNet model from binary + metadata """
+    print(f"\nLoading BitNet from {bin_path}...")
+    
+    # Load metadata
+    metadata = torch.load(meta_path, map_location='cpu')
+    
+    # Create base model
+    m = Transformer().to(device).float()
+    state_dict = m.state_dict()
+    
+    # Load high-precision weights first
+    print("\n--- Loading High-Precision Layers ---")
+    for k, v in metadata["high_prec"].items():
+        print(f"✅ {k}: {v.shape}")
+        # Handle vocab size mismatch
+        if "wte" in k and v.shape[0] < config["vocab_size"]:
+            full_weight = state_dict[k].clone()
+            full_weight[:v.shape[0]] = v.to(device).float()
+            state_dict[k].copy_(full_weight)
+        else:
+            state_dict[k].copy_(v.to(device).float())
+    
+    # Load quantized weights and replace Linear layers
+    print("\n--- Loading Quantized Weights ---")
+    with open(bin_path, "rb") as f:
+        weight_data = f.read()
+    
+    offset = 0
+    replacements = {}  # Store layer replacements to apply after iteration
+    
+    for k, shape in metadata["weight_order"]:
+        # Calculate size for this weight
+        num_elements = np.prod(shape)
+        num_bytes = (num_elements + 4) // 5  # 5 ternary values per byte
+        
+        # Extract and unpack
+        chunk = weight_data[offset:offset + num_bytes]
+        w_ternary = unpack_ternary_base3(chunk, shape)
+        scale = metadata["scales"][k]
+        
+        print(f"✅ {k}: {shape}, scale={scale:.6f}")
+        
+        # Parse the key to find the layer
+        # Example: "transformer.h.0.attn.c_attn.weight"
+        parts = k.split('.')
+        
+        # Find the parent module and layer name
+        if len(parts) >= 2 and parts[-1] == 'weight':
+            layer_path = '.'.join(parts[:-1])  # Everything except .weight
+            
+            try:
+                # Get the actual Linear layer
+                orig_layer = m.get_submodule(layer_path)
+                
+                if isinstance(orig_layer, nn.Linear):
+                    # Create replacement
+                    bias = orig_layer.bias.data if orig_layer.bias is not None else None
+                    new_layer = BitLinearInference(
+                        orig_layer.in_features,
+                        orig_layer.out_features,
+                        w_ternary,
+                        scale,
+                        bias
+                    ).to(device)
+                    
+                    # Store for later replacement
+                    replacements[layer_path] = new_layer
+            except Exception as e:
+                print(f"  ⚠️  Warning: Could not replace {layer_path}: {e}")
+        
+        offset += num_bytes
+    
+    # Apply all replacements
+    print("\n--- Applying Layer Replacements ---")
+    for layer_path, new_layer in replacements.items():
+        parts = layer_path.split('.')
+        parent_path = '.'.join(parts[:-1])
+        layer_name = parts[-1]
+        
+        if parent_path:
+            parent = m.get_submodule(parent_path)
+        else:
+            parent = m
+            
+        setattr(parent, layer_name, new_layer)
+        print(f"✅ Replaced {layer_path}")
+    
+    print(f"\n✅ Model loaded successfully!")
+    print(f"   Replaced {len(replacements)} layers")
+    print(f"   Total size: {(len(weight_data) + sum(t.numel()*2 for t in metadata['high_prec'].values())) / 1e6:.2f} MB")
+    return m
+
+# =========================
+# Sampling
+# =========================
+@torch.no_grad()
+def generate_text(model, prompt="", max_tokens=200, temperature=0.8, top_k=40):
+    model.eval()
+    
+    # Encode prompt
+    if prompt:
+        tokens = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    else:
+        tokens = torch.tensor([[tokenizer.bos_token_id or 0]], device=device)
+    
+    print(f"\nPrompt: '{prompt}'")
+    print("="*60)
+    
+    # Generate
+    output = model.generate(
+        tokens, 
+        max_new_tokens=max_tokens,
+        temperature=temperature,
+        top_k=top_k
+    )
+    
+    text = tokenizer.decode(output[0].tolist())
+    print(text)
+    print("="*60)
+    return text
+
+# =========================
+# Main
+# =========================
+def main():
+    print("="*60)
+    print("BitNet 1.58b Inference")
+    print("="*60)
+    
+    # Load model
+    m = load_bitnet_model(
+        "checkpoints/bitnet_ultra_tiny.bin",
+        "checkpoints/bitnet_ultra_tiny.bin.meta"
+    )
+    
+    # Test prompts
+    prompts = [
+        "",  # Unconditional generation
+        "The quick brown",
+        "Once upon a time",
+        "In the year 2050",
+    ]
+    
+    print("\n" + "="*60)
+    print("GENERATING SAMPLES")
+    print("="*60)
+    
+    for prompt in prompts:
+        generate_text(m, prompt, max_tokens=150, temperature=0.8)
+        print()
+
+if __name__ == "__main__":
+    main()

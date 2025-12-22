@@ -7,7 +7,7 @@ import inspect
 config = {
     "n_embd": 64,         
     "n_head": 2,            
-    "n_layer": 8,         
+    "n_layer": 40,         
     "dropout": 0.2,         
     "vocab_size": 50257,    # update in train
     "ctx_len": 1024,        # update in train 
@@ -164,8 +164,7 @@ class Transformer(nn.Module):
             wte = nn.Embedding(config['vocab_size'], config['n_embd']), # tok embd
             wpe = nn.Embedding(self.block_size, config['n_embd']), # pos embd
             drop = nn.Dropout(config['dropout']),
-            h = nn.ModuleList([Block() for _ in range(config['n_layer'])]),
-            ln_f = nn.RMSNorm(config['n_embd']), # Use bias from config
+            h = nn.ModuleList([Block() for _ in range(config['n_layer'])]) 
         ))
 
         self.lm_head = nn.Linear(config['n_embd'], config['vocab_size'], bias=False)
@@ -207,7 +206,7 @@ class Transformer(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
+        #x = self.transformer.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -330,6 +329,7 @@ class Transformer(nn.Module):
 
         mfu = flops_achieved / flops_promised
         return mfu
+
 
 
 

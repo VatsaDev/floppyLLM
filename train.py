@@ -21,10 +21,10 @@ import model
 from model import Transformer
 
 # hyperparams
-batch_size = 8 #16
+batch_size = 16 #16
 block_size = 1024 # ctx_len
 eval_interval = 20
-grad_accum_steps = 4 # basically microbatch
+grad_accum_steps = 2 # basically microbatch
 
 lr = 1e-3
 min_lr = 1e-4
