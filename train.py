@@ -31,7 +31,7 @@ min_lr = 1e-4
 
 max_iters = 100001
 eval_iters = 20
-warmup_iters = 10 
+warmup_iters = 200 
 
 train_losses_history = []
 val_losses_history = []
@@ -377,7 +377,3 @@ for iter_num in range(start_iter, max_iters + 1):
         print(f"Saved optimized inference model to {fp16_inference_path}")
 
 print('Training finished.')
-
-
-
-

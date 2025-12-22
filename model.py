@@ -6,7 +6,7 @@ import inspect
 
 config = {
     "n_embd": 80,         
-    "n_head": 2,            
+    "n_head": 8, # at higher depths, more heads is considered better?            
     "n_layer": 50,         
     "dropout": 0.2,         
     "vocab_size": 50257,    # update in train
@@ -68,7 +68,12 @@ class CasualSelfAttn(nn.Module):
         self.dropout = config['dropout']
         self.block_size = config['ctx_len']
 
-        self.rope = RoPE(self.n_embd//self.n_head) # setup
+        # qk norm and rope share the same size
+
+        self.q_norm = nn.RMSNorm(self.n_embd//self.n_head) 
+        self.k_norm = nn.RMSNorm(self.n_embd//self.n_head)
+
+        self.rope = RoPE(self.n_embd//self.n_head)
 
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -86,6 +91,11 @@ class CasualSelfAttn(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         
+        # qk norm 
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
         # qk rope
         q = self.rope(q) 
         k = self.rope(k)
@@ -329,7 +339,3 @@ class Transformer(nn.Module):
 
         mfu = flops_achieved / flops_promised
         return mfu
-
-
-
-
