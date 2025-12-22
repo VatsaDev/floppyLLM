@@ -21,7 +21,7 @@ import model
 from model import Transformer
 
 # hyperparams
-batch_size = 16 #16
+batch_size = 30 #16
 block_size = 1024 # ctx_len
 eval_interval = 20
 grad_accum_steps = 2 # basically microbatch
@@ -29,7 +29,7 @@ grad_accum_steps = 2 # basically microbatch
 lr = 1e-3
 min_lr = 1e-4
 
-max_iters = 30001
+max_iters = 40001
 eval_iters = 20
 warmup_iters = 200 
 
@@ -42,7 +42,7 @@ weight_decay = 1e-1
 
 max_grad_norm = 1.0 
 
-ckpt_iter = 1000
+ckpt_iter = 500
 resume = False
 resume_checkpoint = "/content/floppyLLM/checkpoints/sVtcrs_10000.pt" 
 data_dir = "synth_3"
