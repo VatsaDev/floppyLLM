@@ -29,7 +29,7 @@ grad_accum_steps = 2 # basically microbatch
 lr = 1e-3
 min_lr = 1e-4
 
-max_iters = 100001
+max_iters = 30001
 eval_iters = 20
 warmup_iters = 200 
 
