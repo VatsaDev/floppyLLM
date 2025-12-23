@@ -81,7 +81,6 @@ class CasualSelfAttn(nn.Module):
         # scaled value resid, Attn @ V + alpha . V
 
         self.logit_alpha = nn.Parameter(torch.tensor(-2.0))
-        alpha = torch.sigmoid(self.logit_alpha))
 
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -126,7 +125,8 @@ class CasualSelfAttn(nn.Module):
         
         # value residual
 
-        y += alpha * v_r
+        alpha = torch.sigmoid(self.logit_alpha)
+        y = y + alpha * v_r
 
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs
 
@@ -353,3 +353,4 @@ class Transformer(nn.Module):
 
         mfu = flops_achieved / flops_promised
         return mfu
+
