@@ -74,7 +74,14 @@ class CasualSelfAttn(nn.Module):
         self.k_norm = nn.RMSNorm(self.n_embd//self.n_head)
         self.v_norm = nn.RMSNorm(self.n_embd//self.n_head)
 
+        # rope
+
         self.rope = RoPE(self.n_embd//self.n_head)
+
+        # scaled value resid, Attn @ V + alpha . V
+
+        self.logit_alpha = nn.Parameter(torch.tensor(-2.0))
+        alpha = torch.sigmoid(self.logit_alpha))
 
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -97,6 +104,8 @@ class CasualSelfAttn(nn.Module):
 
         q = self.q_norm(q)
         k = self.k_norm(k)
+        
+        v_r = v # raw no norm
         v = self.v_norm(v)
 
         # qk rope
@@ -114,6 +123,10 @@ class CasualSelfAttn(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        
+        # value residual
+
+        y += alpha * v_r
 
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs
 
