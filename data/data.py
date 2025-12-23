@@ -8,7 +8,7 @@ from transformers import AutoTokenizer
 
 # --- Setup & Hyperparameters ---
 tok_path = "../nano_1k" 
-dataset_path = "synth_3"
+dataset_path = "processed_math_data"
 DATA_CACHE_DIR = dataset_path
 shard_size = 10_000_000  # 10 million tokens per shard
 num_workers = 1         # Use 10 cores
