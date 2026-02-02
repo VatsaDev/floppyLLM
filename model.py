@@ -4,6 +4,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 import inspect
 
+# NOTE: FIX VAL RES THE WAY GRAD MENTIONED
+
 config = {
     "n_embd": 80,         
     "n_head": 2, # at higher depths, more heads is considered better?            
@@ -72,8 +74,7 @@ class CasualSelfAttn(nn.Module):
 
         self.q_norm = nn.RMSNorm(self.n_embd//self.n_head) 
         self.k_norm = nn.RMSNorm(self.n_embd//self.n_head)
-        self.v_norm = nn.RMSNorm(self.n_embd//self.n_head)
-
+        
         # rope
 
         self.rope = RoPE(self.n_embd//self.n_head)
@@ -104,10 +105,8 @@ class CasualSelfAttn(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
         
-        v_r = v # raw no norm
-        v = self.v_norm(v)
-
         # qk rope
+
         q = self.rope(q) 
         k = self.rope(k)
 
@@ -126,7 +125,7 @@ class CasualSelfAttn(nn.Module):
         # value residual
 
         alpha = torch.sigmoid(self.logit_alpha)
-        y = y + alpha * v_r
+        y = y + alpha * v
 
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs
 
@@ -134,6 +133,16 @@ class CasualSelfAttn(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         
         return y
+
+# learnable activations??
+
+class SinLU(nn.Module):
+    def __init__(self):
+        super(SinLU,self).__init__()
+        self.a = nn.Parameter(torch.ones(1))
+        self.b = nn.Parameter(torch.ones(1))
+    def forward(self,x):
+        return torch.sigmoid(x)*(x+self.a*torch.sin(self.b*x))
 
 # Swiglu replaces MLP 
 
@@ -147,7 +156,7 @@ class MLP(nn.Module):
         # combine gate and value
         self.gate_value_proj = nn.Linear(config['n_embd'], 2 * appr, bias=False) # Llama uses no bias
         self.linear_out = nn.Linear(appr, config['n_embd'], bias=False)
-        self.silu = nn.SiLU()
+        self.silu = SinLU() # now using learnable activations
 
         self.dropout = nn.Dropout(config['dropout'])
 

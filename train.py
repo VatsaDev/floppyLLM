@@ -21,10 +21,10 @@ import model
 from model import Transformer
 
 # hyperparams
-batch_size = 30 #16
+batch_size = 32 #16
 block_size = 1024 # ctx_len
 eval_interval = 20
-grad_accum_steps = 2 # basically microbatch
+grad_accum_steps = 8 # basically microbatch
 
 lr = 1e-3
 min_lr = 1e-4
@@ -45,7 +45,7 @@ max_grad_norm = 1.0
 ckpt_iter = 500
 resume = False
 resume_checkpoint = "/content/floppyLLM/checkpoints/sVtcrs_10000.pt" 
-data_dir = "synth_3"
+data_dir = "processed_math_data"
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -377,3 +377,4 @@ for iter_num in range(start_iter, max_iters + 1):
         print(f"Saved optimized inference model to {fp16_inference_path}")
 
 print('Training finished.')
+

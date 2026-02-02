@@ -1,59 +1,82 @@
 import os
 import re
 import json
+import torch
 from datasets import load_dataset
 from tqdm import tqdm
 
 # --- Configuration ---
 OUTPUT_DIR = "processed_math_data"
-MAX_ROWS_AUTOMATH = 10_000
-MAX_ROWS_REST = 10_000_000
+MAX_ROWS_AUTOMATH = 100_000 # Keep this low, it's noisy web data
 MAX_FILE_SIZE_BYTES = 1024 * 1024 * 50  # 50MB per chunk
 
-# --- The Scrubber Configuration ---
-CLEANER_PATTERN = re.compile(r'[^\x20-\x7E\n\t•]')
+# --- The Math-Safe Scrubber ---
+# This preserves standard ASCII + common math symbols + LaTeX backslashes
+# If you delete these, the model cannot learn the "logic" of the operations.
+CLEANER_PATTERN = re.compile(r'[^\x20-\x7E\n\tπθΔΣ±÷×√∞≈≠≤≥^\\{}_]')
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def clean_text(text):
     if not text: 
         return ""
-    # Standard ASCII cleanup
+    # 1. Remove non-math-safe characters
     text = CLEANER_PATTERN.sub(' ', text)
+    # 2. Collapse multiple spaces but keep single spaces for readability
     text = re.sub(r' +', ' ', text)
     return text.strip()
 
-def format_chain(seed, reasoning, answer):
-    """Constructs: Seed -> Reasoning -> Answer."""
-    return f"{seed}\n\n{reasoning}\n\n{answer}<|endoftext|>\n"
+def format_chain(problem, reasoning, answer):
+    """
+    Constructs a structured prompt. 
+    Explicit headers are CRITICAL for a 50-layer/2-head model 
+    to stop it from looping or getting lost in the residual stream.
+    """
+    return (
+        f"### Problem: {problem}\n"
+        f"### Solution: {reasoning}\n"
+        f"### Final Answer: {answer}<|endoftext|>\n"
+    )
 
 # --- Dataset Parsers ---
 
-def parse_automath(row):
-    """AutoMathText: Just the 'text' field."""
-    text = clean_text(row.get("text", ""))
-    if not text: return None
-    return f"{text}<|endoftext|>\n"
+def parse_gsm8k(row):
+    """GSM8K: The gold standard for school math reasoning."""
+    # GSM8K answer format is "Reasoning steps... #### 42"
+    q = clean_text(row.get("question", ""))
+    a_field = row.get("answer", "")
+    if "####" in a_field:
+        reasoning, final_ans = a_field.split("####")
+    else:
+        reasoning, final_ans = a_field, ""
+    return format_chain(q, clean_text(reasoning), clean_text(final_ans))
 
 def parse_asdiv(row):
-    """ASDiv: body -> question -> formula -> answer."""
+    """ASDiv: Primary school word problems."""
     body = clean_text(row.get("body", ""))
     question = clean_text(row.get("question", ""))
     formula = clean_text(row.get("formula", ""))
     answer = clean_text(row.get("answer", ""))
     
-    seed = f"{body} {question}".strip()
-    return format_chain(seed, formula, answer)
+    problem = f"{body} {question}".strip()
+    return format_chain(problem, formula, answer)
 
 def parse_mathqa(row):
-    """mathQA/train.json: Problem -> Rationale -> correct (answer)."""
+    """MathQA: Structured rationale and options."""
     problem = clean_text(row.get("Problem", ""))
     rationale = clean_text(row.get("Rationale", ""))
     answer = clean_text(row.get("correct", ""))
     options = clean_text(row.get("options", ""))
     
-    seed = f"{problem}\nOptions: {options}".strip()
-    return format_chain(seed, rationale, answer)
+    full_problem = f"{problem}\nOptions: {options}"
+    return format_chain(full_problem, rationale, answer)
+
+def parse_automath(row):
+    """AutoMathText: Raw text format. Use as a 'flavor' supplement."""
+    text = clean_text(row.get("text", ""))
+    if not text: return None
+    # No reasoning/answer split here, so just wrap it
+    return f"### Math Content:\n{text}<|endoftext|>\n"
 
 # --- Output Management ---
 
@@ -84,38 +107,49 @@ class FileManager:
     def close(self):
         if self.handle: self.handle.close()
 
-# --- Main Script ---
+# --- Main Logic ---
 
 def main():
     writer = FileManager(OUTPUT_DIR, "math_dataset_mix")
 
-    # 1. MathQA (Local JSON)
-    # Path: mathQA/train.json
-    json_path = os.path.join("mathQA", "train.json")
-    if os.path.exists(json_path):
-        print(f"Parsing {json_path}...")
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            # Take up to 100k
-            for row in tqdm(data[:MAX_ROWS_REST], desc="MathQA"):
-                writer.write(parse_mathqa(row))
-    else:
-        print(f"Skipping MathQA: {json_path} not found.")
+    # 1. GSM8K (Highest Priority for your 1.8 loss goal)
+    print("\nParsing GSM8K (Chain of Thought)...")
+    try:
+        gsm = load_dataset("gsm8k", "main", split="train")
+        for row in tqdm(gsm, desc="GSM8K"):
+            writer.write(parse_gsm8k(row))
+    except Exception as e:
+        print(f"Error loading GSM8K: {e}")
 
-    # 2. ASDiv (HF)
+    # 2. MathQA (Local or HF)
+    print("\nParsing MathQA...")
+    try:
+        # Checking for local file first as per your previous script
+        json_path = os.path.join("mathQA", "train.json")
+        if os.path.exists(json_path):
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for row in tqdm(data, desc="MathQA (Local)"):
+                    writer.write(parse_mathqa(row))
+        else:
+            # Fallback to HF if local not found
+            mathqa = load_dataset("math_qa", split="train")
+            for row in tqdm(mathqa, desc="MathQA (HF)"):
+                writer.write(parse_mathqa(row))
+    except Exception as e:
+        print(f"Error loading MathQA: {e}")
+
+    # 3. ASDiv
     print("\nParsing ASDiv...")
     try:
         asdiv = load_dataset("EleutherAI/asdiv", split="validation")
-        # ASDiv is small (~2.3k), so it fits well within 100k limit
-        for i, row in enumerate(tqdm(asdiv, desc="ASDiv")):
-            if i >= MAX_ROWS_REST: break
+        for row in tqdm(asdiv, desc="ASDiv"):
             writer.write(parse_asdiv(row))
     except Exception as e:
         print(f"Error loading ASDiv: {e}")
 
-    # 3. AutoMathText (HF - Streaming)
-    # Limit: 10,000 rows
-    print("\nParsing AutoMathText (Max 10k)...")
+    # 4. AutoMathText (Streaming 10k rows)
+    print(f"\nParsing AutoMathText (Max {MAX_ROWS_AUTOMATH})...")
     try:
         am_ds = load_dataset("math-ai/AutoMathText", "web-0.50-to-1.00", split="train", streaming=True)
         count = 0
@@ -130,7 +164,7 @@ def main():
         print(f"Error loading AutoMathText: {e}")
 
     writer.close()
-    print(f"\nDone! Files saved to {OUTPUT_DIR}/")
+    print(f"\nSuccess! Processed data in {OUTPUT_DIR}/")
 
 if __name__ == "__main__":
     main()
